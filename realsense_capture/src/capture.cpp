@@ -35,10 +35,13 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "...Done setting up subscribers");
 
-        // Prepare rosbag2 writer
+        rclcpp::Time t = this->now();
+        std::time_t sec = static_cast<std::time_t>(t.seconds());
+        std::tm tm = *std::localtime(&sec);
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
         writer = std::make_unique<rosbag2_cpp::Writer>();
-
-        writer->open("bag_" + std::to_string(this->now().seconds()).resize(10));
+        writer->open("bag_" + oss.str());
 
         RCLCPP_INFO(this->get_logger(), "Waiting to capture messages...");
     }

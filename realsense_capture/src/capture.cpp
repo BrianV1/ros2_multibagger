@@ -2,103 +2,154 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rosbag2_cpp/writer.hpp>
+
 #include <thread>
-#include <memory>
-#include <string>
 #include <atomic>
+#include <memory>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 
 class Capture : public rclcpp::Node
 {
 public:
-    Capture()
-        : Node("capture"), depthCaptured(false), cloudCaptured(false)
-    {
-        callback_group_subscriber1_ = this->create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
-        callback_group_subscriber2_ = this->create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
+  Capture()
 
-        auto sub1_opt = rclcpp::SubscriptionOptions();
-        sub1_opt.callback_group = callback_group_subscriber1_;
-        auto sub2_opt = rclcpp::SubscriptionOptions();
-        sub2_opt.callback_group = callback_group_subscriber2_;
+  : Node("capture"),
+    capture_requested(false),
+    depth_written(false),
+    cloud_written(false)
+  {
+    callback_group_subscriber1_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    callback_group_subscriber2_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-        RCLCPP_INFO(this->get_logger(), "Setting up subscribers...");
-        
-        depthImageSub = this->create_subscription<sensor_msgs::msg::Image>(
-            "/camera/camera/depth/image_rect_raw", 10,
-            std::bind(&Capture::depth_image_callback, this, std::placeholders::_1), sub1_opt);
+    rclcpp::SubscriptionOptions sub1_opt;
+    sub1_opt.callback_group = callback_group_subscriber1_;
 
-        pointCloudSub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/camera/camera/depth/color/points", 10,
-            std::bind(&Capture::point_cloud_callback, this, std::placeholders::_1), sub2_opt);
+    rclcpp::SubscriptionOptions sub2_opt;
+    sub2_opt.callback_group = callback_group_subscriber2_;
 
-        RCLCPP_INFO(this->get_logger(), "...Done setting up subscribers");
+    depthImageSub = this->create_subscription<sensor_msgs::msg::Image>(
+      "/camera/camera/depth/image_rect_raw", 10,
+      std::bind(&Capture::depth_image_callback, this, std::placeholders::_1),
+      sub1_opt);
 
-        rclcpp::Time t = this->now();
-        std::time_t sec = static_cast<std::time_t>(t.seconds());
-        std::tm tm = *std::localtime(&sec);
-        std::ostringstream oss;
-        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
-        writer = std::make_unique<rosbag2_cpp::Writer>();
-        writer->open("bag_" + oss.str());
+    pointCloudSub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      "/camera/camera/depth/color/points", 10,
+      std::bind(&Capture::point_cloud_callback, this, std::placeholders::_1),
+      sub2_opt);
 
-        RCLCPP_INFO(this->get_logger(), "Waiting to capture messages...");
-    }
+    writer = std::make_unique<rosbag2_cpp::Writer>();
+    writer->open(make_bag_name());
+    rclcpp::on_shutdown(std::bind(&Capture::on_shutdown_handler, this));
+
+
+    RCLCPP_INFO(this->get_logger(),
+      "Press ENTER to capture depth + cloud into the same bag.");
+
+    keyboard_thread = std::thread(&Capture::keyboard_loop, this);
+  }
+
+  ~Capture()
+  {
+    keyboard_thread.join();
+  }
 
 private:
-    void depth_image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
-    {
-        if (depthCaptured.load()) return;
+  std::string make_bag_name()
+  {
+    std::time_t t = std::time(nullptr);
+    std::tm tm = *std::localtime(&t);
+    std::ostringstream oss;
+    oss << "bag_" << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S");
+    return oss.str();
+  }
 
-        RCLCPP_INFO(this->get_logger(), "Captured DEPTH image");
-        
-        writer->write(*msg, "/camera/camera/depth/image_rect_raw", rclcpp::Time(msg->header.stamp));
-        depthCaptured.store(true);
-
-        check_and_shutdown();
+  void keyboard_loop()
+  {
+    while (rclcpp::ok()) {
+      std::cin.get();  // wait for ENTER
+      depth_written.store(false);
+      cloud_written.store(false);
+      capture_requested.store(true);
+      RCLCPP_INFO(this->get_logger(), "Capture requested");
     }
+  }
 
-    void point_cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
-    {
-        if (cloudCaptured.load()) return;
+  void depth_image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
+  {
+    if (!capture_requested.load() || depth_written.load()) return;
 
-        RCLCPP_INFO(this->get_logger(), "Captured POINT CLOUD");
-        
-        writer->write(*msg, "/camera/camera/depth/color/points", rclcpp::Time(msg->header.stamp));
-        cloudCaptured.store(true);
+    writer->write(
+      *msg,
+      "/camera/camera/depth/image_rect_raw",
+      rclcpp::Time(msg->header.stamp));
 
-        check_and_shutdown();
+    depth_written.store(true);
+    RCLCPP_INFO(this->get_logger(), "Depth captured");
+
+    check_capture_complete();
+  }
+
+  void point_cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    if (!capture_requested.load() || cloud_written.load()) return;
+
+    writer->write(
+      *msg,
+      "/camera/camera/depth/color/points",
+      rclcpp::Time(msg->header.stamp));
+
+    cloud_written.store(true);
+    RCLCPP_INFO(this->get_logger(), "Point cloud captured");
+
+    check_capture_complete();
+  }
+
+  void check_capture_complete()
+  {
+    if (depth_written.load() && cloud_written.load()) {
+      capture_requested.store(false);
+      RCLCPP_INFO(this->get_logger(), "Capture complete (waiting for next key)");
     }
+  }
 
-    void check_and_shutdown()
-    {
-        if (depthCaptured.load() && cloudCaptured.load()) {
-            RCLCPP_INFO(this->get_logger(), "Both depth and cloud captured, shutting down...");
-            // Give writer time to flush
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            rclcpp::shutdown();
-        }
-    }
+  void on_shutdown_handler()
+  {
+    RCLCPP_INFO(this->get_logger(), "Shutting down, finalizing bag...");
+    writer.reset();
+  }
 
-    rclcpp::CallbackGroup::SharedPtr callback_group_subscriber1_;
-    rclcpp::CallbackGroup::SharedPtr callback_group_subscriber2_;
-    
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depthImageSub;
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointCloudSub;
-    
-    std::unique_ptr<rosbag2_cpp::Writer> writer;
-    std::atomic<bool> depthCaptured;
-    std::atomic<bool> cloudCaptured;
+
+
+  rclcpp::CallbackGroup::SharedPtr callback_group_subscriber1_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_subscriber2_;
+
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depthImageSub;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointCloudSub;
+
+  std::unique_ptr<rosbag2_cpp::Writer> writer;
+
+  std::atomic<bool> capture_requested;
+  std::atomic<bool> depth_written;
+  std::atomic<bool> cloud_written;
+
+  std::thread keyboard_thread;
 };
 
 int main(int argc, char **argv)
 {
-    rclcpp::init(argc, argv);
-    auto node = std::make_shared<Capture>();
-    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
-    executor.add_node(node);
-    executor.spin();
-    rclcpp::shutdown();
-    return 0;
+  rclcpp::init(argc, argv);
+
+  auto node = std::make_shared<Capture>();
+  rclcpp::executors::MultiThreadedExecutor exec(
+    rclcpp::ExecutorOptions(), 2);
+
+  exec.add_node(node);
+  exec.spin();
+
+  rclcpp::shutdown();
+  return 0;
 }
